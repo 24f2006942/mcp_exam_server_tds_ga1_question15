@@ -49,9 +49,9 @@ def load_ledger_data():
                 
     df = pd.DataFrame(records)
     
-    # Deduplicate updates
+    # Deduplicate updates (latest updated_at)
     if "updated_at" in df.columns and "id" in df.columns:
-        df["updated_at"] = pd.to_datetime(df["updated_at"], errors="coerce", utc=True)
+        df["updated_at"] = pd.to_datetime(df["updated_at"], errors="coerce")
         df = df.sort_values("updated_at").drop_duplicates(subset=["id"], keep="last")
         
     # Fetch exchange rates
@@ -61,6 +61,7 @@ def load_ledger_data():
         try:
             rates_res = requests.get(rates_link)
             rates_json = rates_res.json()
+            print("Rates JSON:", rates_json)
             if isinstance(rates_json, list):
                 for r in rates_json:
                     cur = r.get("currency") or r.get("code")
@@ -69,8 +70,8 @@ def load_ledger_data():
                         rates[str(cur).upper()] = float(val)
             elif isinstance(rates_json, dict):
                 rates.update({str(k).upper(): float(v) for k, v in rates_json.items()})
-        except Exception:
-            pass
+        except Exception as e:
+            print("Error loading rates:", e)
             
     cached_df = df
     cached_rates = rates
@@ -80,7 +81,7 @@ def load_ledger_data():
 def startup_event():
     try:
         load_ledger_data()
-        print("Data loaded successfully.")
+        print("Data loaded successfully. Rates:", cached_rates)
     except Exception as e:
         print(f"Startup error: {e}")
 
@@ -91,21 +92,21 @@ async def answer_question(req: QuestionRequest):
         q = req.question.lower()
         sub_df = df.copy()
         
-        # 1. Filter Status
-        if "paid" in q:
+        # 1. Status Filter
+        if "paid orders only" in q or "paid" in q:
             sub_df = sub_df[sub_df["status"].str.lower() == "paid"]
         elif "refund" in q:
             sub_df = sub_df[sub_df["status"].str.lower() == "refunded"]
         elif "void" in q:
             sub_df = sub_df[sub_df["status"].str.lower() == "void"]
 
-        # 2. Filter Region (West, Central, North, South, East)
+        # 2. Region Filter
         regions = ["west", "central", "north", "south", "east"]
         matched_reg = next((r for r in regions if r in q), None)
         if matched_reg:
             sub_df = sub_df[sub_df["region"].str.lower() == matched_reg]
 
-        # 3. Filter Date / Month / Year using created_at
+        # 3. Date / Month / Year Filter using created_at
         months = {
             "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
             "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
@@ -117,25 +118,32 @@ async def answer_question(req: QuestionRequest):
         matched_year = int(years[0]) if years else None
         
         if (matched_month or matched_year) and "created_at" in sub_df.columns:
-            dt_series = pd.to_datetime(sub_df["created_at"], errors="coerce", utc=True)
+            dt_series = pd.to_datetime(sub_df["created_at"], errors="coerce")
             if matched_month:
                 sub_df = sub_df[dt_series.dt.month == months[matched_month]]
             if matched_year:
                 sub_df = sub_df[dt_series.dt.year == matched_year]
 
-        # 4. Filter Product (Exact or partial match on product column)
+        # 4. Product Filter
         if "product" in sub_df.columns:
             unique_procs = sub_df["product"].dropna().unique()
             matched_prod = None
             for p in unique_procs:
                 p_lower = str(p).lower()
-                if p_lower in q or any(w in q for w in p_lower.split() if len(w) > 2):
+                # Check if product name or its words appear in query
+                if p_lower in q:
                     matched_prod = p
                     break
+            if matched_prod is None:
+                for p in unique_procs:
+                    p_lower = str(p).lower()
+                    if all(w in q for w in p_lower.split() if len(w) > 2):
+                        matched_prod = p
+                        break
             if matched_prod is not None:
                 sub_df = sub_df[sub_df["product"] == matched_prod]
 
-        # 5. Currency Conversion to USD for amounts
+        # 5. Currency Conversion to USD
         if "amount" in sub_df.columns and "currency" in sub_df.columns:
             sub_df["amount"] = pd.to_numeric(sub_df["amount"], errors="coerce")
             def to_usd(row):
@@ -152,24 +160,19 @@ async def answer_question(req: QuestionRequest):
         else:
             calc_col = "amount" if "amount" in sub_df.columns else None
 
-        # Safety Fallback
-        if sub_df.empty:
-            sub_df = df.copy()
-            if "amount" in sub_df.columns and "currency" in sub_df.columns:
-                sub_df["usd_amount"] = sub_df.apply(lambda r: r["amount"] if str(r["currency"]).upper()=="USD" else r["amount"]*rates.get(str(r["currency"]).upper(), 1.0), axis=1)
-                calc_col = "usd_amount"
-
-        # 6. Question Intent Handlers
+        # 6. Intent Routing
         if "average" in q or "avg" in q or "mean" in q:
-            if calc_col:
+            if calc_col and not sub_df.empty:
                 return {"answer": round(float(sub_df[calc_col].mean()), 2)}
             return {"answer": 0.0}
 
         if "distinct" in q or "customer" in q or "buyer" in q:
-            return {"answer": int(sub_df["customer"].nunique())}
+            if not sub_df.empty:
+                return {"answer": int(sub_df["customer"].nunique())}
+            return {"answer": 0}
 
         if "revenue" in q or "total" in q or "sales" in q or "sum" in q:
-            if calc_col:
+            if calc_col and not sub_df.empty:
                 return {"answer": round(float(sub_df[calc_col].sum()), 2)}
             return {"answer": 0.0}
 
