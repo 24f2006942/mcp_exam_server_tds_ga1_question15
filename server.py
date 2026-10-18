@@ -14,11 +14,12 @@ class QuestionRequest(BaseModel):
     question: str
 
 cached_df = None
+cached_rates = None
 
 def load_ledger_data():
-    global cached_df
+    global cached_df, cached_rates
     if cached_df is not None:
-        return cached_df
+        return cached_df, cached_rates
     
     base_params = {
         "email": EMAIL,
@@ -34,13 +35,7 @@ def load_ledger_data():
     if export_link:
         orders_res = requests.get(export_link)
     else:
-        orders_params = {
-            "email": EMAIL,
-            "quizSign": QUIZ_SIGN,
-            "questionId": "q-ledger-agent-server",
-            "path": "/orders"
-        }
-        orders_res = requests.get(BASE_WORKER_URL, params=orders_params)
+        orders_res = requests.get(BASE_WORKER_URL, params={"email": EMAIL, "quizSign": QUIZ_SIGN, "questionId": "q-ledger-agent-server", "path": "/orders"})
         
     text_content = orders_res.text.strip()
     
@@ -69,13 +64,30 @@ def load_ledger_data():
                 
     df = pd.DataFrame(orders_json)
     
-    # Apply deduplication rule: latest updated_at is current for each order id
     if "updated_at" in df.columns and "id" in df.columns:
         df["updated_at"] = pd.to_datetime(df["updated_at"], errors="coerce", utc=True)
         df = df.sort_values("updated_at").drop_duplicates(subset=["id"], keep="last")
         
+    rates_link = root_data.get("links", {}).get("rates")
+    rates = {}
+    if rates_link:
+        try:
+            rates_res = requests.get(rates_link)
+            rates_json = rates_res.json()
+            if isinstance(rates_json, list):
+                for r in rates_json:
+                    cur = r.get("currency") or r.get("code")
+                    val = r.get("rate") or r.get("usd") or r.get("value")
+                    if cur and val:
+                        rates[str(cur).upper()] = float(val)
+            elif isinstance(rates_json, dict):
+                rates = {str(k).upper(): float(v) for k, v in rates_json.items()}
+        except Exception:
+            pass
+            
     cached_df = df
-    return cached_df
+    cached_rates = rates
+    return cached_df, cached_rates
 
 @app.on_event("startup")
 def startup_event():
@@ -88,40 +100,58 @@ def startup_event():
 @app.post("/")
 async def answer_question(req: QuestionRequest):
     try:
-        df = load_ledger_data()
+        df, rates = load_ledger_data()
         q = req.question.lower()
         
-        # Filter paid orders if specified or implied
         sub_df = df.copy()
+        
+        # 1. Filter status (paid)
         if "paid" in q and "status" in sub_df.columns:
             sub_df = sub_df[sub_df["status"].str.lower() == "paid"]
             
-        # Handle Product filtering (e.g. "rice cooker")
-        matched_product = None
-        # Check column names that might represent product
-        prod_col = next((c for c in ["product", "item", "product_name", "name"] if c in sub_df.columns), None)
-        if prod_col:
-            unique_procs = sub_df[prod_col].dropna().unique()
-            for p in unique_procs:
-                if str(p).lower() in q:
-                    matched_product = p
-                    break
-            if matched_product is not None:
-                sub_df = sub_df[sub_df[prod_col] == matched_product]
+        # 2. Filter region (e.g. "central")
+        region_keywords = ["central", "east", "west", "north", "south"]
+        matched_region = next((r for r in region_keywords if r in q), None)
+        if matched_region:
+            reg_col = next((c for c in ["region", "territory", "location", "zone", "state"] if c in sub_df.columns), None)
+            if reg_col:
+                sub_df = sub_df[sub_df[reg_col].astype(str).str.lower() == matched_region]
+                
+        # 3. Handle currency conversion to USD if currency column exists and rates available
+        val_col = next((c for c in ["amount", "total", "price", "revenue"] if c in sub_df.columns), None)
+        if val_col and "currency" in sub_df.columns and rates:
+            sub_df[val_col] = pd.to_numeric(sub_df[val_col], errors="coerce")
+            def convert_to_usd(row):
+                cur = str(row.get("currency", "USD")).upper()
+                amt = row[val_col]
+                if cur == "USD":
+                    return amt
+                rate = rates.get(cur, 1.0)
+                return amt * rate
+            sub_df["usd_amount"] = sub_df.apply(convert_to_usd, axis=1)
+            calc_col = "usd_amount"
+        else:
+            if val_col:
+                sub_df[val_col] = pd.to_numeric(sub_df[val_col], errors="coerce")
+                calc_col = val_col
+            else:
+                calc_col = None
 
-        # Handle Distinct Customers count
-        if "distinct" in q or "how many" in q and ("customer" in q or "buyer" in q or "user" in q):
+        # 4. Handle Average / Mean
+        if ("average" in q or "avg" in q) and calc_col:
+            return {"answer": round(float(sub_df[calc_col].mean()), 2)}
+
+        # 5. Handle Distinct Customers count
+        if "distinct" in q or ("how many" in q and ("customer" in q or "buyer" in q or "user" in q)):
             cust_col = next((c for c in ["customer_id", "customer", "email", "user_id"] if c in sub_df.columns), None)
             if cust_col:
                 return {"answer": int(sub_df[cust_col].nunique())}
 
-        # Handle Revenue / Total sum
-        if "revenue" in q or "total" in q or "sales" in q or "amount" in q:
-            val_col = next((c for c in ["amount", "total", "price", "revenue"] if c in sub_df.columns), None)
-            if val_col:
-                return {"answer": round(float(sub_df[val_col].sum()), 2)}
+        # 6. Handle Revenue / Total sum
+        if ("revenue" in q or "total" in q or "sales" in q) and calc_col:
+            return {"answer": round(float(sub_df[calc_col].sum()), 2)}
 
-        # Default count of rows
+        # Default fallback
         return {"answer": len(sub_df)}
         
     except Exception as e:
