@@ -69,7 +69,7 @@ def load_ledger_data():
                 
     df = pd.DataFrame(orders_json)
     
-    # Apply deduplication rule with utc=True to handle mixed timezones safely
+    # Apply deduplication rule: latest updated_at is current for each order id
     if "updated_at" in df.columns and "id" in df.columns:
         df["updated_at"] = pd.to_datetime(df["updated_at"], errors="coerce", utc=True)
         df = df.sort_values("updated_at").drop_duplicates(subset=["id"], keep="last")
@@ -91,12 +91,38 @@ async def answer_question(req: QuestionRequest):
         df = load_ledger_data()
         q = req.question.lower()
         
-        if "revenue" in q or "total" in q or "sales" in q:
-            paid_df = df[df["status"].str.lower() == "paid"] if "status" in df.columns else df
-            col = "amount" if "amount" in paid_df.columns else ("total" if "total" in paid_df.columns else None)
-            if col:
-                return {"answer": round(float(paid_df[col].sum()), 2)}
-                
-        return {"answer": len(df)}
+        # Filter paid orders if specified or implied
+        sub_df = df.copy()
+        if "paid" in q and "status" in sub_df.columns:
+            sub_df = sub_df[sub_df["status"].str.lower() == "paid"]
+            
+        # Handle Product filtering (e.g. "rice cooker")
+        matched_product = None
+        # Check column names that might represent product
+        prod_col = next((c for c in ["product", "item", "product_name", "name"] if c in sub_df.columns), None)
+        if prod_col:
+            unique_procs = sub_df[prod_col].dropna().unique()
+            for p in unique_procs:
+                if str(p).lower() in q:
+                    matched_product = p
+                    break
+            if matched_product is not None:
+                sub_df = sub_df[sub_df[prod_col] == matched_product]
+
+        # Handle Distinct Customers count
+        if "distinct" in q or "how many" in q and ("customer" in q or "buyer" in q or "user" in q):
+            cust_col = next((c for c in ["customer_id", "customer", "email", "user_id"] if c in sub_df.columns), None)
+            if cust_col:
+                return {"answer": int(sub_df[cust_col].nunique())}
+
+        # Handle Revenue / Total sum
+        if "revenue" in q or "total" in q or "sales" in q or "amount" in q:
+            val_col = next((c for c in ["amount", "total", "price", "revenue"] if c in sub_df.columns), None)
+            if val_col:
+                return {"answer": round(float(sub_df[val_col].sum()), 2)}
+
+        # Default count of rows
+        return {"answer": len(sub_df)}
+        
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
