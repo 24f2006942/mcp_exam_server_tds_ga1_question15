@@ -1,217 +1,179 @@
-import json
-import requests
-import pandas as pd
 import re
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+import json
+import sqlite3
+import pandas as pd
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+
+RATES_URL = "https://exam.sanand.workers.dev/questionData?email=24f2006942%40ds.study.iitm.ac.in&quizSign=u4Rf%2FVHuXKZzfboOlrvTEeDTWVnRDaIUsuIxjUO44Og%2BZjetWp1hG5wlWtYuLmuBAvyvviBwblPnQLgr3PaYVPsdDLJbptVAKzCKAmEC9jWRcv2qfQicAokgUSH0M7KAfij%2FHJVAex6VvXynO%2B2UeocnEAtIfGmm6fRqV5y2WbkIUas4sx56P%2FsOGuFhckv3BH5tFl+Zdbe%2FYeECY8khdK7xZmWYONiGk6ElsXY9aFdweyq5Uu4tWpqUtBdeBO8ec5PpnFScGh7MYBzXe%2BDmnMtjNZsT6Owc5gZgepGDDbp68e0N0oqJeePpPhbu9weZqyHaC%2FqnSgY357qYNLL%2BVg%3D%3D&questionId=q-ledger-agent-server&path=%2Frates"
+EXPORT_URL = "https://exam.sanand.workers.dev/questionData?email=24f2006942%40ds.study.iitm.ac.in&quizSign=u4Rf%2FVHuXKZzfboOlrvTEeDTWVnRDaIUsuIxjUO44Og%2BZjetWp1hG5wlWtYuLmuBAvyvviBwblPnQLgr3PaYVPsdDLJbptVAKzCKAmEC9jWRcv2qfQicAokgUSH0M7KAfij%2FHJVAex6VvXynO%2B2UeocnEAtIfGmm6fRqV5y2WbkIUas4sx56P%2FsOGuFhckv3BH5tFl+Zdbe%2FYeECY8khdK7xZmWYONiGk6ElsXY9aFdweyq5Uu4tWpqUtBdeBO8ec5PpnFScGh7MYBzXe%2BDmnMtjNZsT6Owc5gZgepGDDbp68e0N0oqJeePpPhbu9weZqyHaC%2FqnSgY357qYNLL%2BVg%3D%3D&questionId=q-ledger-agent-server&path=%2Fexport"
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
+
+db_conn = sqlite3.connect(":memory:", check_same_thread=False)
+
+def init_database():
+    with httpx.Client(timeout=30.0) as client:
+        print("Fetching currency rates from /rates...")
+        resp_rates = client.get(RATES_URL, headers=HEADERS)
+        resp_rates.raise_for_status()
+        usd_rates = resp_rates.json()["usd_per_unit"]
+        print("Currency Rates:", usd_rates)
+        
+        print("Fetching raw order ledger from /export...")
+        resp_export = client.get(EXPORT_URL, headers=HEADERS)
+        resp_export.raise_for_status()
+        raw_lines = resp_export.text.strip().splitlines()
+        rows = [json.loads(line) for line in raw_lines if line.strip()]
+        print(f"Total raw records downloaded: {len(rows)}")
+
+    df = pd.DataFrame(rows)
+
+    # 1. Parse timestamps into timezone-aware UTC
+    df["created_at_utc"] = pd.to_datetime(df["created_at"], format="ISO8601", utc=True)
+    df["updated_at_utc"] = pd.to_datetime(df["updated_at"], format="ISO8601", utc=True)
+
+    # 2. Deduplicate: sort by updated_at and keep the last updated row per order id
+    df = df.sort_values("updated_at_utc", kind="mergesort").drop_duplicates(subset=["id"], keep="last").copy()
+    print(f"Total verified active orders: {len(df)}")
+
+    # 3. Convert business dates to Asia/Kolkata timezone
+    ist_created = df["created_at_utc"].dt.tz_convert("Asia/Kolkata")
+    df["created_date"] = ist_created.dt.strftime("%Y-%m-%d")
+    df["created_month"] = ist_created.dt.strftime("%Y-%m")
+    df["created_year"] = ist_created.dt.year
+
+    # 4. Standardize all transactions into USD
+    df["rate_to_usd"] = df["currency"].map(usd_rates)
+    df["amount_usd"] = df["amount"] * df["rate_to_usd"]
+
+    df_sql = df.drop(columns=["created_at_utc", "updated_at_utc"])
+    df_sql.to_sql("orders", db_conn, index=False, if_exists="replace")
+    print("In-memory SQLite database ready.")
+
+init_database()
+
+MONTH_MAP = {
+    "january": "01", "february": "02", "march": "03", "april": "04",
+    "may": "05", "june": "06", "july": "07", "august": "08",
+    "september": "09", "october": "10", "november": "11", "december": "12"
+}
+PRODUCTS = [
+    "Air Fryer", "Rice Cooker", "Juicer", "Toaster",
+    "Mixer", "Kettle", "Blender", "Grinder"
+]
+REGIONS = ["North", "South", "East", "West", "Central"]
+
+def parse_question_to_sql(question: str):
+    q_low = question.lower()
+    conditions = []
+    
+    # Status classification
+    if re.search(r"\brefund(ed|s)?\b", q_low):
+        conditions.append("status = 'refunded'")
+    elif re.search(r"\b(void|voided|cancel|cancelled)\b", q_low):
+        conditions.append("status = 'void'")
+    else:
+        conditions.append("status = 'paid'")
+
+    # Region filter
+    for reg in REGIONS:
+        if re.search(rf"\b{reg.lower()}\b", q_low):
+            conditions.append(f"region = '{reg}'")
+            break
+
+    # Product filter
+    for prod in PRODUCTS:
+        if re.search(rf"\b{re.escape(prod.lower())}s?\b", q_low):
+            conditions.append(f"product = '{prod}'")
+            break
+
+    # Customer ID filter
+    cust_match = re.search(r"\b(c\d{4})\b", q_low)
+    if cust_match:
+        conditions.append(f"customer = '{cust_match.group(1).upper()}'")
+
+    # Date / Month / Year filter
+    year_match = re.search(r"\b(202\d)\b", q_low)
+    year_str = year_match.group(1) if year_match else "2026"
+
+    month_num = None
+    for m_name, m_val in MONTH_MAP.items():
+        if re.search(rf"\b{m_name}\b", q_low):
+            month_num = m_val
+            break
+
+    if month_num:
+        conditions.append(f"created_month = '{year_str}-{month_num}'")
+    elif year_match and "month" not in q_low:
+        conditions.append(f"created_year = {year_str}")
+
+    where_clause = " AND ".join(conditions) if conditions else "1=1"
+
+    # Route by question intent
+    if any(p in q_low for p in ["which product", "what product", "top-selling product", "best-selling product", "product earned the most"]):
+        order_metric = "SUM(qty)" if any(w in q_low for w in ["qty", "quantity", "units"]) else "SUM(amount_usd)"
+        sql = f"SELECT product FROM orders WHERE {where_clause} GROUP BY product ORDER BY {order_metric} DESC LIMIT 1"
+        return sql, "string"
+
+    if any(p in q_low for p in ["which customer", "what customer", "top customer", "customer spent the most"]):
+        sql = f"SELECT customer FROM orders WHERE {where_clause} GROUP BY customer ORDER BY SUM(amount_usd) DESC LIMIT 1"
+        return sql, "string"
+
+    if any(p in q_low for p in ["which region", "what region", "top region", "region earned the most"]):
+        sql = f"SELECT region FROM orders WHERE {where_clause} GROUP BY region ORDER BY SUM(amount_usd) DESC LIMIT 1"
+        return sql, "string"
+
+    if any(p in q_low for p in ["distinct customer", "different customer", "unique customer", "how many customer"]):
+        sql = f"SELECT COUNT(DISTINCT customer) FROM orders WHERE {where_clause}"
+        return sql, "int"
+
+    if "average" in q_low:
+        sql = f"SELECT ROUND(COALESCE(AVG(amount_usd), 0), 2) FROM orders WHERE {where_clause}"
+        return sql, "money"
+
+    if any(p in q_low for p in ["how many orders", "count the", "number of orders", "how many refunded"]):
+        sql = f"SELECT COUNT(*) FROM orders WHERE {where_clause}"
+        return sql, "int"
+
+    if any(p in q_low for p in ["how many units", "total quantity", "total units"]):
+        sql = f"SELECT COALESCE(SUM(qty), 0) FROM orders WHERE {where_clause}"
+        return sql, "int"
+
+    # Default: Total Revenue / Earnings / Sales
+    sql = f"SELECT ROUND(COALESCE(SUM(amount_usd), 0), 2) FROM orders WHERE {where_clause}"
+    return sql, "money"
 
 app = FastAPI()
-
-BASE_WORKER_URL = "https://exam.sanand.workers.dev/questionData"
-EMAIL = "24f2006942@ds.study.iitm.ac.in"
-QUIZ_SIGN = "u4Rf/VHuXKZzfboOlrvTEeDTWVnRDaIUsuIxjUO44Og+ZjetWp1hG5wlWtYuLmuBAvyvviBwblPnQLgr3PaYVPsdDLJbptVAKzCKAmEC9jWRcv2qfQicAokgUSH0M7KAfij/HJVAex6VvXynO+2UeocnEAtIfGmm6fRqV5y2WbkIUas4sx56P/sOGuFhckv3BH5tFl+Zdbe/YeECY8khdK7xZmWYONiGk6ElsXY9aFdweyq5Uu4tWpqUtBdeBO8ec5PpnFScGh7MYBzXe+DmnMtjNZsT6Owc5gZgepGDDbp68e0N0oqJeePpPhbu9weZqyHaC/qnSgY357qYNLL+Vg=="
-
-class QuestionRequest(BaseModel):
-    question: str
-
-cached_df = None
-cached_rates = None
-
-def load_ledger_data():
-    global cached_df, cached_rates
-    if cached_df is not None:
-        return cached_df, cached_rates
-    
-    try:
-        base_params = {
-            "email": EMAIL,
-            "quizSign": QUIZ_SIGN,
-            "questionId": "q-ledger-agent-server",
-            "path": "/"
-        }
-        
-        res = requests.get(BASE_WORKER_URL, params=base_params, timeout=15)
-        root_data = res.json()
-        
-        export_link = root_data.get("links", {}).get("export")
-        if export_link:
-            orders_res = requests.get(export_link, timeout=15)
-        else:
-            orders_res = requests.get(BASE_WORKER_URL, params={"email": EMAIL, "quizSign": QUIZ_SIGN, "questionId": "q-ledger-agent-server", "path": "/orders"}, timeout=15)
-            
-        records = []
-        for line in orders_res.text.strip().splitlines():
-            line = line.strip()
-            if line:
-                try:
-                    records.append(json.loads(line))
-                except:
-                    pass
-                    
-        df = pd.DataFrame(records)
-        
-        if "updated_at" in df.columns and "id" in df.columns:
-            df["updated_at"] = pd.to_datetime(df["updated_at"], errors="coerce")
-            df = df.sort_values("updated_at").drop_duplicates(subset=["id"], keep="last")
-            
-        rates_link = root_data.get("links", {}).get("rates")
-        rates = {"USD": 1.0}
-        if rates_link:
-            try:
-                rates_res = requests.get(rates_link, timeout=10)
-                rates_json = rates_res.json()
-                if isinstance(rates_json, list):
-                    for r in rates_json:
-                        cur = r.get("currency") or r.get("code")
-                        val = r.get("rate") or r.get("usd") or r.get("value")
-                        if cur and val:
-                            rates[str(cur).upper()] = float(val)
-                elif isinstance(rates_json, dict):
-                    rates.update({str(k).upper(): float(v) for k, v in rates_json.items()})
-            except Exception as e:
-                print("Error loading rates:", e)
-                
-        cached_df = df
-        cached_rates = rates
-        print(f"Successfully loaded {len(df)} records.")
-        return cached_df, cached_rates
-    except Exception as e:
-        print(f"CRITICAL ERROR in load_ledger_data: {e}")
-        raise e
-
-@app.on_event("startup")
-def startup_event():
-    try:
-        load_ledger_data()
-    except Exception as e:
-        print(f"Startup error: {e}")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.post("/")
-async def answer_question(req: QuestionRequest):
-    try:
-        df, rates = load_ledger_data()
-        q = req.question.lower()
-        sub_df = df.copy()
-        
-        def get_usd_series(dframe):
-            if "amount" not in dframe.columns:
-                return pd.Series(0.0, index=dframe.index)
-            amounts = pd.to_numeric(dframe["amount"], errors="coerce").fillna(0.0)
-            if "currency" not in dframe.columns:
-                return amounts
-            currencies = dframe["currency"].astype(str).str.upper()
-            converted = []
-            for amt, cur in zip(amounts, currencies):
-                if cur == "USD":
-                    converted.append(amt)
-                else:
-                    rate = rates.get(cur, 1.0)
-                    converted.append(amt * rate)
-            return pd.Series(converted, index=dframe.index)
+async def answer_question(request: Request):
+    body = await request.json()
+    question = body.get("question", "")
+    print(f"\n[INCOMING QUESTION] {question}")
+    sql_query, ans_type = parse_question_to_sql(question)
+    print(f"[SQL EXECUTED] {sql_query}")
 
-        # 1. Status Filter
-        if "paid" in q or "revenue" in q or "sales" in q or "worth" in q:
-            if "status" in sub_df.columns:
-                temp = sub_df[sub_df["status"].str.lower() == "paid"]
-                if not temp.empty:
-                    sub_df = temp
-        elif "refund" in q:
-            if "status" in sub_df.columns:
-                temp = sub_df[sub_df["status"].str.lower() == "refunded"]
-                if not temp.empty:
-                    sub_df = temp
-        elif "void" in q:
-            if "status" in sub_df.columns:
-                temp = sub_df[sub_df["status"].str.lower() == "void"]
-                if not temp.empty:
-                    sub_df = temp
+    cursor = db_conn.cursor()
+    cursor.execute(sql_query)
+    row = cursor.fetchone()
+    val = row[0] if row and row[0] is not None else 0
 
-        # 2. Region Filter
-        regions = ["west", "central", "north", "south", "east"]
-        matched_reg = next((r for r in regions if r in q), None)
-        if matched_reg and "region" in sub_df.columns:
-            temp = sub_df[sub_df["region"].str.lower() == matched_reg]
-            if not temp.empty:
-                sub_df = temp
+    if ans_type == "string":
+        result = str(val)
+    elif ans_type == "int":
+        result = int(val)
+    else:
+        result = round(float(val), 2)
 
-        # 3. Date / Month / Year Filter
-        months = {
-            "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
-            "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
-            "august": 8, "aug": 8, "september": 9, "sep": 9, "october": 10, "oct": 10,
-            "november": 11, "nov": 11, "december": 12, "dec": 12
-        }
-        matched_month = next((m for m in months if m in q), None)
-        years = re.findall(r'\b20\d{2}\b', q)
-        matched_year = int(years[0]) if years else None
-        
-        if (matched_month or matched_year) and "created_at" in sub_df.columns:
-            dt_series = pd.to_datetime(sub_df["created_at"], errors="coerce")
-            temp = sub_df.copy()
-            if matched_month:
-                temp = temp[dt_series.dt.month == months[matched_month]]
-            if matched_year:
-                temp = temp[dt_series.dt.year == matched_year]
-            if not temp.empty:
-                sub_df = temp
-
-        # 4. Product Filter
-        if "product" in sub_df.columns:
-            unique_procs = sub_df["product"].dropna().unique()
-            matched_prod = None
-            for p in unique_procs:
-                p_str = str(p).lower()
-                if p_str in q:
-                    matched_prod = p
-                    break
-            if matched_prod is None:
-                for p in unique_procs:
-                    p_str = str(p).lower()
-                    words = [w for w in p_str.split() if len(w) > 2]
-                    if words and all(w in q for w in words):
-                        matched_prod = p
-                        break
-            if matched_prod is not None:
-                temp = sub_df[sub_df["product"] == matched_prod]
-                if not temp.empty:
-                    sub_df = temp
-            else:
-                stop_words = {"how", "many", "distinct", "customers", "have", "bought", "a", "the", "paid", "orders", "only", "what", "is", "average", "order", "value", "in", "usd", "for", "region", "total", "revenue", "sales", "was", "worth", "on", "sum"}
-                q_words = [w for w in q.replace("?", "").replace(",", "").split() if w not in stop_words and len(w) > 2]
-                matched_subset = pd.DataFrame()
-                for qw in q_words:
-                    mask = sub_df["product"].astype(str).str.lower().str.contains(qw, na=False)
-                    if mask.any():
-                        matched_subset = pd.concat([matched_subset, sub_df[mask]]).drop_duplicates()
-                if not matched_subset.empty:
-                    sub_df = matched_subset
-
-        sub_df["usd_amount"] = get_usd_series(sub_df)
-        calc_col = "usd_amount"
-
-        # Intent Routing
-        if "average" in q or "avg" in q or "mean" in q or "worth" in q:
-            if not sub_df.empty:
-                return {"answer": round(float(sub_df[calc_col].mean()), 2)}
-            return {"answer": round(float(df[calc_col].mean()), 2) if "calc_col" in locals() and not df.empty else 0.0}
-
-        if "distinct" in q or "customer" in q or "buyer" in q:
-            if not sub_df.empty and "customer" in sub_df.columns:
-                return {"answer": int(sub_df["customer"].nunique())}
-            return {"answer": int(df["customer"].nunique()) if not df.empty else 0}
-
-        if "revenue" in q or "total" in q or "sales" in q or "sum" in q:
-            if not sub_df.empty:
-                return {"answer": round(float(sub_df[calc_col].sum()), 2)}
-            return {"answer": round(float(df[calc_col].sum()), 2) if not df.empty else 0.0}
-
-        if not sub_df.empty:
-            return {"answer": len(sub_df)}
-        
-        return {"answer": len(df)}
-
-    except Exception as e:
-        print(f"Error handling query: {e}")
-        if cached_df is not None:
-            return {"answer": len(cached_df)}
-        return {"answer": 4000}
+    print(f"[RESPONSE] {result}")
+    return {"answer": result}
