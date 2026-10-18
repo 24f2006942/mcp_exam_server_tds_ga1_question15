@@ -6,8 +6,9 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-RATES_URL = "https://exam.sanand.workers.dev/questionData?email=24f2006942%40ds.study.iitm.ac.in&quizSign=u4Rf%2FVHuXKZzfboOlrvTEeDTWVnRDaIUsuIxjUO44Og%2BZjetWp1hG5wlWtYuLmuBAvyvviBwblPnQLgr3PaYVPsdDLJbptVAKzCKAmEC9jWRcv2qfQicAokgUSH0M7KAfij%2FHJVAex6VvXynO%2B2UeocnEAtIfGmm6fRqV5y2WbkIUas4sx56P%2FsOGuFhckv3BH5tFl+Zdbe%2FYeECY8khdK7xZmWYONiGk6ElsXY9aFdweyq5Uu4tWpqUtBdeBO8ec5PpnFScGh7MYBzXe%2BDmnMtjNZsT6Owc5gZgepGDDbp68e0N0oqJeePpPhbu9weZqyHaC%2FqnSgY357qYNLL%2BVg%3D%3D&questionId=q-ledger-agent-server&path=%2Frates"
-EXPORT_URL = "https://exam.sanand.workers.dev/questionData?email=24f2006942%40ds.study.iitm.ac.in&quizSign=u4Rf%2FVHuXKZzfboOlrvTEeDTWVnRDaIUsuIxjUO44Og%2BZjetWp1hG5wlWtYuLmuBAvyvviBwblPnQLgr3PaYVPsdDLJbptVAKzCKAmEC9jWRcv2qfQicAokgUSH0M7KAfij%2FHJVAex6VvXynO%2B2UeocnEAtIfGmm6fRqV5y2WbkIUas4sx56P%2FsOGuFhckv3BH5tFl+Zdbe%2FYeECY8khdK7xZmWYONiGk6ElsXY9aFdweyq5Uu4tWpqUtBdeBO8ec5PpnFScGh7MYBzXe%2BDmnMtjNZsT6Owc5gZgepGDDbp68e0N0oqJeePpPhbu9weZqyHaC%2FqnSgY357qYNLL%2BVg%3D%3D&questionId=q-ledger-agent-server&path=%2Fexport"
+BASE_WORKER_URL = "https://exam.sanand.workers.dev/questionData"
+EMAIL = "24f2006942@ds.study.iitm.ac.in"
+QUIZ_SIGN = "u4Rf/VHuXKZzfboOlrvTEeDTWVnRDaIUsuIxjUO44Og+ZjetWp1hG5wlWtYuLmuBAvyvviBwblPnQLgr3PaYVPsdDLJbptVAKzCKAmEC9jWRcv2qfQicAokgUSH0M7KAfij/HJVAex6VvXynO+2UeocnEAtIfGmm6fRqV5y2WbkIUas4sx56P/sOGuFhckv3BH5tFl+Zdbe/YeECY8khdK7xZmWYONiGk6ElsXY9aFdweyq5Uu4tWpqUtBdeBO8ec5PpnFScGh7MYBzXe+DmnMtjNZsT6Owc5gZgepGDDbp68e0N0oqJeePpPhbu9weZqyHaC/qnSgY357qYNLL+Vg=="
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -17,14 +18,42 @@ db_conn = sqlite3.connect(":memory:", check_same_thread=False)
 
 def init_database():
     with httpx.Client(timeout=30.0) as client:
-        print("Fetching currency rates from /rates...")
-        resp_rates = client.get(RATES_URL, headers=HEADERS)
+        print("Fetching root metadata to get secure links...")
+        base_params = {
+            "email": EMAIL,
+            "quizSign": QUIZ_SIGN,
+            "questionId": "q-ledger-agent-server",
+            "path": "/"
+        }
+        resp = client.get(BASE_WORKER_URL, params=base_params, headers=HEADERS)
+        resp.raise_for_status()
+        root_data = resp.json()
+        
+        export_link = root_data.get("links", {}).get("export")
+        rates_link = root_data.get("links", {}).get("rates")
+        
+        print("Fetching currency rates...")
+        resp_rates = client.get(rates_link, headers=HEADERS)
         resp_rates.raise_for_status()
-        usd_rates = resp_rates.json()["usd_per_unit"]
+        rates_json = resp_rates.json()
+        
+        # Parse rates correctly whether list or dict
+        usd_rates = {"USD": 1.0}
+        if isinstance(rates_json, dict) and "usd_per_unit" in rates_json:
+            usd_rates = rates_json["usd_per_unit"]
+        elif isinstance(rates_json, list):
+            for r in rates_json:
+                cur = r.get("currency") or r.get("code")
+                val = r.get("rate") or r.get("usd") or r.get("value")
+                if cur and val:
+                    usd_rates[str(cur).upper()] = float(val)
+        elif isinstance(rates_json, dict):
+            usd_rates = {str(k).upper(): float(v) for k, v in rates_json.items()}
+
         print("Currency Rates:", usd_rates)
         
-        print("Fetching raw order ledger from /export...")
-        resp_export = client.get(EXPORT_URL, headers=HEADERS)
+        print("Fetching raw order ledger from export link...")
+        resp_export = client.get(export_link, headers=HEADERS)
         resp_export.raise_for_status()
         raw_lines = resp_export.text.strip().splitlines()
         rows = [json.loads(line) for line in raw_lines if line.strip()]
@@ -33,8 +62,8 @@ def init_database():
     df = pd.DataFrame(rows)
 
     # 1. Parse timestamps into timezone-aware UTC
-    df["created_at_utc"] = pd.to_datetime(df["created_at"], format="ISO8601", utc=True)
-    df["updated_at_utc"] = pd.to_datetime(df["updated_at"], format="ISO8601", utc=True)
+    df["created_at_utc"] = pd.to_datetime(df["created_at"], format="ISO8601", errors="coerce", utc=True)
+    df["updated_at_utc"] = pd.to_datetime(df["updated_at"], format="ISO8601", errors="coerce", utc=True)
 
     # 2. Deduplicate: sort by updated_at and keep the last updated row per order id
     df = df.sort_values("updated_at_utc", kind="mergesort").drop_duplicates(subset=["id"], keep="last").copy()
@@ -47,14 +76,17 @@ def init_database():
     df["created_year"] = ist_created.dt.year
 
     # 4. Standardize all transactions into USD
-    df["rate_to_usd"] = df["currency"].map(usd_rates)
+    df["rate_to_usd"] = df["currency"].map(usd_rates).fillna(1.0)
     df["amount_usd"] = df["amount"] * df["rate_to_usd"]
 
     df_sql = df.drop(columns=["created_at_utc", "updated_at_utc"])
     df_sql.to_sql("orders", db_conn, index=False, if_exists="replace")
     print("In-memory SQLite database ready.")
 
-init_database()
+try:
+    init_database()
+except Exception as e:
+    print(f"Error initializing database during startup: {e}")
 
 MONTH_MAP = {
     "january": "01", "february": "02", "march": "03", "april": "04",
@@ -160,10 +192,16 @@ async def answer_question(request: Request):
     body = await request.json()
     question = body.get("question", "")
     print(f"\n[INCOMING QUESTION] {question}")
+    
+    # Ensure DB has data if startup initialization failed transiently
+    cursor = db_conn.cursor()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='orders'")
+    if not cursor.fetchone():
+        init_database()
+
     sql_query, ans_type = parse_question_to_sql(question)
     print(f"[SQL EXECUTED] {sql_query}")
 
-    cursor = db_conn.cursor()
     cursor.execute(sql_query)
     row = cursor.fetchone()
     val = row[0] if row and row[0] is not None else 0
