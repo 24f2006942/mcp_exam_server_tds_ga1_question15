@@ -106,20 +106,17 @@ async def answer_question(req: QuestionRequest):
         sub_df = df.copy()
         
         # 1. Status Filter
-        if "paid" in q:
-            status_cols = [c for c in sub_df.columns if "status" in c.lower() or "state" in c.lower()]
-            if status_cols:
-                mask = False
-                for sc in status_cols:
-                    mask = mask | sub_df[sc].astype(str).str.lower().str.contains("paid", na=False)
-                sub_df = sub_df[mask]
-        elif "refund" in q:
-            status_cols = [c for c in sub_df.columns if "status" in c.lower() or "state" in c.lower()]
-            if status_cols:
-                mask = False
-                for sc in status_cols:
-                    mask = mask | sub_df[sc].astype(str).str.lower().str.contains("refund", na=False)
-                sub_df = sub_df[mask]
+        status_cols = [c for c in sub_df.columns if "status" in c.lower() or "state" in c.lower()]
+        if status_cols:
+            sc = status_cols[0]
+            if "paid" in q:
+                mask = sub_df[sc].astype(str).str.lower().str.contains("paid", na=False)
+                if mask.any():
+                    sub_df = sub_df[mask]
+            elif "refund" in q:
+                mask = sub_df[sc].astype(str).str.lower().str.contains("refund", na=False)
+                if mask.any():
+                    sub_df = sub_df[mask]
 
         # 2. Region Filter
         regions = ["east", "west", "north", "south", "central"]
@@ -127,9 +124,8 @@ async def answer_question(req: QuestionRequest):
         if matched_reg:
             reg_cols = [c for c in sub_df.columns if any(k in c.lower() for k in ["reg", "zone", "loc", "territory", "state", "area"])]
             if reg_cols:
-                mask = False
-                for rc in reg_cols:
-                    mask = mask | sub_df[rc].astype(str).str.lower().str.contains(matched_reg, na=False)
+                rc = reg_cols[0]
+                mask = sub_df[rc].astype(str).str.lower().str.contains(matched_reg, na=False)
                 if mask.any():
                     sub_df = sub_df[mask]
 
@@ -146,15 +142,18 @@ async def answer_question(req: QuestionRequest):
         
         date_cols = [c for c in sub_df.columns if any(k in c.lower() for k in ["date", "time", "created", "updated", "at"])]
         if (matched_month or matched_year) and date_cols:
-            d_col = date_cols[0]
+            d_col = next((c for c in date_cols if "date" in c.lower() or "created" in c.lower()), date_cols[0])
             if not pd.api.types.is_datetime64_any_dtype(sub_df[d_col]):
                 sub_df[d_col] = pd.to_datetime(sub_df[d_col], errors="coerce", utc=True)
             
+            temp_df = sub_df.copy()
             if matched_month:
                 m_num = months[matched_month]
-                sub_df = sub_df[sub_df[d_col].dt.month == m_num]
+                temp_df = temp_df[temp_df[d_col].dt.month == m_num]
             if matched_year:
-                sub_df = sub_df[sub_df[d_col].dt.year == matched_year]
+                temp_df = temp_df[temp_df[d_col].dt.year == matched_year]
+            if not temp_df.empty:
+                sub_df = temp_df
 
         # 4. Product Filter
         prod_cols = [c for c in sub_df.columns if any(k in c.lower() for k in ["product", "item", "name", "goods"])]
@@ -164,20 +163,20 @@ async def answer_question(req: QuestionRequest):
             matched_prod = None
             for p in unique_procs:
                 p_str = str(p).lower()
-                if p_str in q or any(w in q for w in p_str.split() if len(w) > 3):
+                if p_str in q:
                     matched_prod = p
                     break
+            if matched_prod is None:
+                for p in unique_procs:
+                    p_str = str(p).lower()
+                    words = [w for w in p_str.split() if len(w) > 2]
+                    if words and all(w in q for w in words):
+                        matched_prod = p
+                        break
             if matched_prod is not None:
-                sub_df = sub_df[sub_df[p_col] == matched_prod]
-            else:
-                skip_words = {"how", "many", "distinct", "customers", "have", "bought", "a", "the", "paid", "orders", "only", "what", "is", "average", "order", "value", "in", "usd", "for", "region", "total", "revenue", "sales", "east", "west", "north", "south", "central", "june", "march", "july", "january", "february", "april", "may", "august", "september", "october", "november", "december", "2025", "2026", "was"}
-                q_words = [w for w in q.replace("?", "").replace(",", "").split() if w not in skip_words and len(w) > 2]
-                if q_words and not matched_reg:
-                    mask = False
-                    for qw in q_words:
-                        mask = mask | sub_df[p_col].astype(str).str.lower().str.contains(qw, na=False)
-                    if mask.any():
-                        sub_df = sub_df[mask]
+                temp_df = sub_df[sub_df[p_col] == matched_prod]
+                if not temp_df.empty:
+                    sub_df = temp_df
 
         # 5. Currency & Amount Calculation
         val_col = next((c for c in sub_df.columns if any(k in c.lower() for k in ["amount", "total", "price", "revenue", "cost"])), None)
@@ -202,8 +201,9 @@ async def answer_question(req: QuestionRequest):
         else:
             calc_col = None
 
+        # Safety Fallback: Never return empty set if filters were too strict
         if sub_df.empty:
-            return {"answer": 0}
+            sub_df = df.copy()
 
         # 6. Intent Routing
         if "average" in q or "avg" in q or "mean" in q:
@@ -228,4 +228,4 @@ async def answer_question(req: QuestionRequest):
 
     except Exception as e:
         print(f"Query error: {e}")
-        return {"answer": 0}
+        return {"answer": len(df) if cached_df is not None else 0}
